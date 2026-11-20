@@ -1,0 +1,155 @@
+# =============================================================================
+# planisferio.yaml — Planisferio 2D LiDAR SLAM
+# =============================================================================
+# The ONLY file to edit when moving Planisferio to another robot.
+#
+# What Planisferio needs from your system:
+#   1. a 2D LiDAR publishing sensor_msgs/LaserScan                  (scan_topic)
+#   2. wheel (or any) odometry publishing nav_msgs/Odometry          (odom_topic)
+#      and the matching TF  <odom frame> -> <base frame>
+#   3. TF <base frame> -> <laser frame> (the LiDAR mounting), or the laser_*
+#      fallback values below
+# What it offers:
+#   nav_msgs/OccupancyGrid map, TF <map frame> -> <odom frame>, the corrected
+#   pose and trajectory, and the services <namespace>/reset, /save_map, /optimize.
+#
+# Section 1 is robot-specific: review it for every new robot.
+# The other sections hold algorithm settings with tested starting values.
+# Copy this file next to your own launch files, keep only what you change,
+# and pass it with:  ros2 launch planisferio planisferio.launch.py params_file:=<file>
+# =============================================================================
+
+/**:
+  ros__parameters:
+
+    # =========================================================================
+    # 1. ROBOT: topics, frames, LiDAR mounting
+    # =========================================================================
+    scan_topic: /scan              # sensor_msgs/LaserScan in
+    odom_topic: /odom              # nav_msgs/Odometry in
+    map_topic: /map                # nav_msgs/OccupancyGrid out (transient local)
+    namespace: /slam               # prefix of the other outputs and the services
+    map_frame: map
+    odom_frame: ""                 # "" = taken from the odometry header.frame_id
+    base_frame: ""                 # "" = taken from the odometry child_frame_id
+
+    # LiDAR mounting. Read from TF <base frame> -> <laser frame> when it exists;
+    # these values are used only if that transform does not appear within
+    # laser_tf_timeout seconds of the first scan.
+    laser_tf_timeout: 3.0          # [s]
+    laser_x: 0.0                   # [m] forward of the base frame
+    laser_y: 0.0                   # [m] to the left
+    laser_yaw: 0.0                 # [rad]
+
+    # How much of each scan to use. Keep the ranges at or below the real
+    # reliable range of your LiDAR.
+    map_beam_step: 4               # ray-trace every Nth beam into the map
+    match_beams: 180               # beams per particle for scan matching
+    map_max_range: 10.0            # [m] longer returns are not drawn
+    match_max_range: 10.0          # [m] longer returns are not matched
+    use_no_return_free_space: true # a beam with no return clears space up to map_max_range
+
+    # Odometry and TF timing
+    max_odom_gap: 0.15             # [s] largest gap to interpolate odometry over
+    tf_publish_rate: 20.0          # [Hz] map -> odom
+    tf_post_date: 0.1              # [s] map -> odom is stamped this far ahead (REP 105)
+
+    # =========================================================================
+    # 2. MAP
+    # =========================================================================
+    resolution: 0.05               # [m/cell]
+    initial_map_size_m: 20.0       # [m] the grid grows automatically
+    l_free: -0.4                   # log-odds added for a free cell
+    l_occ: 0.85                    # log-odds added for an occupied cell
+    l_min: -5.0                    # log-odds clamp
+    l_max: 5.0
+    occupied_threshold: 0.6        # probability above which a cell is a wall for matching
+    map_publish_period: 1.0        # [s]
+    graph_publish_period: 1.0      # [s] <namespace>/path and <namespace>/graph
+
+    # Saving (<namespace>/save_map): map_server format, PGM + YAML
+    save_dir: ~/maps
+    map_name_prefix: map           # files are <prefix>_<date>_<time>.pgm / .yaml
+    save_free_max: 50              # occupancy <= this is free (white)
+    save_occupied_min: 65          # occupancy >= this is occupied (black)
+
+    status_period: 1.0             # [s] <namespace>/status (0 = off)
+
+    # =========================================================================
+    # 3. FRONT-END: particle filter + likelihood field
+    # =========================================================================
+    num_particles: 200
+    motion_alphas: [0.05, 0.01, 0.05, 0.01]  # odometry noise: rot<-rot, rot<-trans,
+                                             #                 trans<-trans, trans<-rot
+    likelihood_beta: 0.1           # flattens the scan likelihood (robust to unmodeled error)
+    resample_ratio: 0.5            # resample when N_eff < ratio * particles
+
+    sigma_hit: 0.10                # [m] std of a LiDAR hit around a wall
+    z_hit: 0.9                     # weight of the hit model
+    z_rand: 0.1                    # weight of random returns
+    field_max_dist: 0.5            # [m] distances beyond this count as "far"
+    field_half_size_m: 12.0        # [m] half size of the likelihood-field window
+
+    update_min_d: 0.05             # [m] moved before a filter update
+    update_min_a: 0.05             # [rad] turned before a filter update
+    keyframe_d: 0.15               # [m] moved before a new keyframe
+    keyframe_a: 0.1745             # [rad] turned before a new keyframe (10 deg)
+
+    # Match against the recent keyframes only, so drift stays visible to the
+    # back-end. Keep local_map_window >= about 2x the LiDAR range.
+    frontend_local_map: true
+    local_map_window: 20.0         # [m of travelled path]
+    local_map_min_keyframes: 10
+    local_map_max_keyframes: 200
+
+    # =========================================================================
+    # 4. POSE GRAPH: uncertainty of the edge between consecutive keyframes
+    # =========================================================================
+    # Robot frame: along the direction of travel, sideways, heading. Each is a
+    # fixed part plus a part that grows with distance and rotation. These
+    # values were calibrated against ground truth with the benchmark
+    # (ros2 run planisferio benchmark). Loosen them if corrections bend straight
+    # corridors on your robot; tighten them if loops do not close.
+    seq_sigma_along: 0.003         # [m]
+    seq_sigma_along_per_m: 0.01    # [m per m travelled]
+    seq_sigma_cross: 0.001         # [m]
+    seq_sigma_cross_per_m: 0.003   # [m per m travelled]
+    seq_sigma_theta: 0.0004        # [rad]
+    seq_sigma_theta_per_rad: 0.005 # [rad per rad turned]
+    seq_sigma_theta_per_m: 0.001   # [rad per m travelled]
+    seq_use_particle_cov: false    # add the particle-cloud covariance (not recommended)
+
+    # =========================================================================
+    # 5. BACK-END: loop closure
+    # =========================================================================
+    loop_closure: true
+    loop_threaded: true            # optimize and rebuild in a background thread
+
+    # Detection: "have I been here before?"
+    loop_min_path: 10.0            # [m] an old keyframe must be this far back along the path
+    loop_search_radius: 3.0        # [m] (x, y) distance that counts as "the same place"
+    loop_max_candidates: 2         # old keyframes verified per new keyframe
+    loop_check_every: 2            # check every Nth keyframe
+    loop_max_backlog: 40           # keyframes queued while the back-end is busy
+
+    # Verification: correlative scan matching (branch and bound)
+    loop_match_window: 1.5         # [m] +/- search; the largest drift a loop can fix
+    loop_match_window_angle: 0.2618  # [rad] +/- search (15 deg)
+    loop_match_resolution: 0.05    # [m]
+    loop_match_sigma: 0.05         # [m] smoothing of the match score
+    loop_submap_path: 2.5          # [m] submap = old keyframes within +/- this path
+    loop_submap_max_keyframes: 25
+    loop_min_score: 0.50           # accept a match above this mean score (0..1)
+    loop_min_inliers: 0.60         # ...with this fraction of points on old walls
+    loop_voxel: 0.08               # [m] voxel size of the matched point set
+    loop_max_points: 400
+
+    # Optimization (Gauss-Newton / Levenberg-Marquardt, Huber kernel)
+    loop_sigma_xy_min: 0.03        # [m] floor on the loop-edge uncertainty
+    loop_sigma_theta_min: 0.0087   # [rad] (0.5 deg)
+    loop_huber_delta: 2.0          # robust kernel threshold (sqrt chi2)
+    loop_outlier_chi2: 16.27       # loop edges above this after optimizing are rejected
+    loop_trigger_xy: 0.05          # [m] optimize when a closure disagrees by more...
+    loop_trigger_theta: 0.0175     # [rad] ...or by more than 1 deg
+    loop_max_pending: 10           # ...or after this many small closures
+    loop_rebuild_min_correction: 0.02  # [m] skip the map rebuild below this
