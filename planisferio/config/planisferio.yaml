@@ -51,6 +51,8 @@
 
     # Odometry and TF timing
     max_odom_gap: 0.15             # [s] largest gap to interpolate odometry over
+    odom_wait: 0.0                 # [s] a scan newer than the odometry waits this long for it
+                                   #     (0 = drop it; raise it on slow computers, e.g. 0.5)
     tf_publish_rate: 20.0          # [Hz] map -> odom
     tf_post_date: 0.1              # [s] map -> odom is stamped this far ahead (REP 105)
 

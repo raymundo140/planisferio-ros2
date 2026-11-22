@@ -32,6 +32,8 @@ Services
   <ns>/save_map     std_srvs/Trigger   PGM + YAML in save_dir (map_server format), plus the
                                        session file (.npz) when save_session is true
   <ns>/optimize     std_srvs/Trigger   force a pose-graph optimization + map rebuild
+  <ns>/localization_only  std_srvs/Trigger   stop changing the map, keep localizing
+  <ns>/mapping            std_srvs/Trigger   change the map again (the default)
 Map reuse
   load_session      parameter: a session file (.npz) to start from instead of an empty map;
                     the node then waits for a pose before it localizes
@@ -112,6 +114,10 @@ class Planisferio(Node):
         self.laser_fallback = (p("laser_x", 0.0).value, p("laser_y", 0.0).value,
                                p("laser_yaw", 0.0).value)
         self.max_odom_gap = p("max_odom_gap", 0.15).value
+        # A scan newer than the newest odometry waits this long for it instead of being
+        # dropped (odometry delivered late on a loaded computer). 0 = drop at once.
+        self.odom_wait = float(p("odom_wait", 0.0).value)
+        self.pending_scan = None
         self.map_publish_period = p("map_publish_period", 1.0).value
         self.graph_publish_period = p("graph_publish_period", 1.0).value
         self.tf_publish_rate = p("tf_publish_rate", 20.0).value
@@ -239,6 +245,10 @@ class Planisferio(Node):
         self.create_service(Trigger, ns + "/reset", self.on_reset)
         self.create_service(Trigger, ns + "/save_map", self.on_save_map)
         self.create_service(Trigger, ns + "/optimize", self.on_optimize)
+        self.create_service(Trigger, ns + "/localization_only",
+                            lambda req, res: self.on_set_mapping(False, res))
+        self.create_service(Trigger, ns + "/mapping",
+                            lambda req, res: self.on_set_mapping(True, res))
         self.create_subscription(PoseWithCovarianceStamped, ns + "/set_pose", self.on_set_pose, 10)
         if self.initial_pose_topic:
             self.create_subscription(PoseWithCovarianceStamped, self.initial_pose_topic,
@@ -289,9 +299,14 @@ class Planisferio(Node):
                                    "in the odometry node", throttle_duration_sec=5.0)
             return
         self.odom_buffer.add(t, pose)
+        pending = self.pending_scan
+        if pending is not None and t >= stamp_to_sec(pending.header.stamp):
+            self.pending_scan = None
+            self.on_scan(pending, counted=True)
 
-    def on_scan(self, scan):
-        self.stats["scans"] += 1
+    def on_scan(self, scan, counted=False):
+        if not counted:
+            self.stats["scans"] += 1
         self.last_scan_wall = time.monotonic()
         ranges = np.asarray(scan.ranges, dtype=np.float64)
 
@@ -303,13 +318,21 @@ class Planisferio(Node):
         with np.errstate(invalid="ignore"):
             ok = np.isfinite(ranges) & (ranges >= scan.range_min) & (ranges <= scan.range_max)
         out.ranges = np.where(ok, ranges, np.inf).astype(np.float32).tolist()
-        self.scan_pub.publish(out)
+        if not counted:                            # a waiting scan was published already
+            self.scan_pub.publish(out)
 
         if not self.laser_ready and not self.resolve_laser_mounting(scan.header.frame_id):
             return
 
         t = stamp_to_sec(scan.header.stamp)
         odom_pose = self.odom_buffer.pose_at(t)
+        last_t, _ = self.odom_buffer.latest()
+        if (odom_pose is None and not counted and last_t is not None
+                and 0.0 < t - last_t <= self.odom_wait):
+            if self.pending_scan is not None:      # an older one never got its odometry
+                self.stats["skipped_odom"] += 1
+            self.pending_scan = scan               # processed when odometry reaches t
+            return
         if odom_pose is None:
             self.stats["skipped_odom"] += 1
             last_t, _ = self.odom_buffer.latest()
@@ -537,6 +560,15 @@ class Planisferio(Node):
         self.slam.request_optimization()
         response.success = True
         response.message = "Optimization requested; the corrected map is applied when ready"
+        return response
+
+    def on_set_mapping(self, mapping, response):
+        """Switch between mapping and localization only, without a restart."""
+        self.slam.cfg.localization_only = not mapping
+        response.success = True
+        response.message = ("mapping: the map is updated" if mapping else
+                            "localization only: the map no longer changes")
+        self.get_logger().info(response.message)
         return response
 
     def on_set_pose(self, msg):

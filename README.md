@@ -57,6 +57,8 @@ exploration.
 | service | `<ns>/reset` | `std_srvs/Trigger` | Start a new map |
 | service | `<ns>/save_map` | `std_srvs/Trigger` | Save `<save_dir>/<prefix>_<date>_<time>.pgm/.yaml`, and the session `…_session.npz` for map reuse |
 | service | `<ns>/optimize` | `std_srvs/Trigger` | Force an optimization and map rebuild |
+| service | `<ns>/localization_only` | `std_srvs/Trigger` | Stop changing the map and keep localizing on it (no restart) |
+| service | `<ns>/mapping` | `std_srvs/Trigger` | Change the map again (the default mode) |
 | in | `<ns>/set_pose`, `/initialpose` | `geometry_msgs/PoseWithCovarianceStamped` | Place the robot on a loaded map, or re-place it during a run (RViz "2D Pose Estimate") |
 
 ## Install
@@ -149,6 +151,7 @@ Checklist for a new robot:
 | A correction bends straight corridors | Odometry edges too loose in heading or sideways | Lower `seq_sigma_theta*` and `seq_sigma_cross*` |
 | Loops close but the map is slightly too long or short | A global scale error, which loop closure cannot observe | Calibrate the wheel radius and separation |
 | Pose jumps or the map smears while turning | Odometry and scans out of sync, or a wrong LiDAR mounting | Check the TF `base -> laser`, the timestamps and `max_odom_gap` |
+| Many "Skipping scan: no odometry at scan time" warnings | The odometry arrives later than the scans (a busy computer) | Set `odom_wait` (e.g. 0.5 s): a scan then waits for its odometry instead of being dropped |
 
 ## Benchmark
 
