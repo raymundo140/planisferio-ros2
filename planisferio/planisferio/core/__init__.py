@@ -12,3 +12,4 @@ from .scan_matcher import CorrelativeScanMatcher
 from .loop_closure import LoopClosureBackend, LoopClosureConfig
 from .slam_system import SlamSystem, SlamConfig, SlamResult
 from .map_io import occupancy_to_pgm, save_map
+from .session import save_session, load_session

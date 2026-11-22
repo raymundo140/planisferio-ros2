@@ -29,8 +29,15 @@ Outputs (<ns> = the "namespace" parameter, default /slam)
   TF <map frame> -> <odom frame>
 Services
   <ns>/reset        std_srvs/Trigger   start a new map
-  <ns>/save_map     std_srvs/Trigger   PGM + YAML in save_dir (map_server format)
+  <ns>/save_map     std_srvs/Trigger   PGM + YAML in save_dir (map_server format), plus the
+                                       session file (.npz) when save_session is true
   <ns>/optimize     std_srvs/Trigger   force a pose-graph optimization + map rebuild
+Map reuse
+  load_session      parameter: a session file (.npz) to start from instead of an empty map;
+                    the node then waits for a pose before it localizes
+  <ns>/set_pose     geometry_msgs/PoseWithCovarianceStamped  place or re-place the robot
+  initial_pose_topic (default /initialpose, RViz "2D Pose Estimate") does the same
+  localization_only parameter: keep localizing without changing the map
 """
 
 import collections
@@ -59,7 +66,8 @@ from visualization_msgs.msg import Marker, MarkerArray
 import tf2_ros
 
 from planisferio.core import (HAVE_SCIPY, LoopClosureConfig, OdometryBuffer,
-                              ScanPreprocessor, SlamConfig, SlamSystem, save_map)
+                              ScanPreprocessor, SlamConfig, SlamSystem, load_session,
+                              save_map, save_session)
 from planisferio.core.se2 import (quaternion_from_yaw, rotation_matrix_from_quaternion,
                                   yaw_from_quaternion)
 
@@ -110,6 +118,9 @@ class Planisferio(Node):
         self.tf_post_date = p("tf_post_date", 0.1).value
         self.save_dir = os.path.expanduser(p("save_dir", "~/maps").value)
         self.map_name_prefix = p("map_name_prefix", "map").value
+        self.save_session_with_map = p("save_session", True).value
+        self.load_session_path = os.path.expanduser(str(p("load_session", "").value or ""))
+        self.initial_pose_topic = p("initial_pose_topic", "/initialpose").value
         self.status_period = p("status_period", 1.0).value
         # Saved maps: cells with occupancy <= save_free_max are free (white),
         # >= save_occupied_min occupied (black). The map holds probabilities:
@@ -177,6 +188,7 @@ class Planisferio(Node):
             seq_sigma_theta_per_m=p("seq_sigma_theta_per_m", d.seq_sigma_theta_per_m).value,
             seq_use_particle_cov=p("seq_use_particle_cov", d.seq_use_particle_cov).value,
             loop=loop,
+            localization_only=p("localization_only", False).value
         )
         self.pre = ScanPreprocessor(
             map_beam_step=p("map_beam_step", 4).value,
@@ -227,6 +239,18 @@ class Planisferio(Node):
         self.create_service(Trigger, ns + "/reset", self.on_reset)
         self.create_service(Trigger, ns + "/save_map", self.on_save_map)
         self.create_service(Trigger, ns + "/optimize", self.on_optimize)
+        self.create_subscription(PoseWithCovarianceStamped, ns + "/set_pose", self.on_set_pose, 10)
+        if self.initial_pose_topic:
+            self.create_subscription(PoseWithCovarianceStamped, self.initial_pose_topic,
+                                     self.on_set_pose, 10)
+        if self.load_session_path:
+            n = load_session(self.slam, self.load_session_path)
+            self.graph_dirty = True
+            self.get_logger().info(
+                f"Loaded session {self.load_session_path}: {n} keyframes. Waiting for a pose "
+                f"on {ns}/set_pose or {self.initial_pose_topic}"
+                + (" (localization only: the map will not change)" if cfg.localization_only
+                   else ""))
 
         self.create_timer(self.map_publish_period, self.publish_map)
         self.create_timer(self.graph_publish_period, self.publish_graph_if_dirty)
@@ -305,8 +329,10 @@ class Planisferio(Node):
         self.stats["proc_ms"].append((time.perf_counter() - t0) * 1000.0)
         del self.stats["proc_ms"][:-200]
         self.stats["used"] += 1
-        self.last_result = res
         self.used_wall.append(time.monotonic())
+        if not self.slam.localized:
+            return                          # loaded map, waiting for set_pose
+        self.last_result = res
 
         self.publish_pose(scan.header.stamp, res)
         if res.filter_updated:
@@ -375,7 +401,7 @@ class Planisferio(Node):
     # Publishing
     # ==================================================================
     def publish_map_to_odom(self):
-        if not self.slam.initialized:
+        if not self.slam.localized:
             return
         corr = self.slam.map_to_odom()
         msg = TransformStamped()
@@ -496,6 +522,7 @@ class Planisferio(Node):
     # ==================================================================
     def on_reset(self, request, response):
         self.slam.reset()
+        self.load_session_path = ""
         self.loop_count = 0
         self.graph_dirty = True
         self._reset_status()
@@ -512,6 +539,25 @@ class Planisferio(Node):
         response.message = "Optimization requested; the corrected map is applied when ready"
         return response
 
+    def on_set_pose(self, msg):
+        """Place the robot on the map (after load_session, or to re-localize)."""
+        if msg.header.frame_id and msg.header.frame_id != self.map_frame:
+            self.get_logger().warn(f"set_pose ignored: frame {msg.header.frame_id!r}, "
+                                   f"expected {self.map_frame!r}")
+            return
+        p, q = msg.pose.pose.position, msg.pose.pose.orientation
+        yaw = yaw_from_quaternion(q.x, q.y, q.z, q.w)
+        c = msg.pose.covariance
+        std = (math.sqrt(max(c[0], 0.0)) or 0.05, math.sqrt(max(c[7], 0.0)) or 0.05,
+               math.sqrt(max(c[35], 0.0)) or 0.05)
+        std = (min(max(std[0], 0.01), 1.0), min(max(std[1], 0.01), 1.0),
+               min(max(std[2], 0.01), 1.0))
+        self.slam.set_pose((p.x, p.y, yaw), std)
+        self.last_result = None
+        self.get_logger().info(f"Pose set to x={p.x:.2f} y={p.y:.2f} "
+                               f"th={math.degrees(yaw):.0f}deg (sd {std[0]:.2f} m, "
+                               f"{math.degrees(std[2]):.0f} deg); applied at the next scan")
+
     def on_save_map(self, request, response):
         if not self.slam.initialized:
             response.success, response.message = False, "Map is empty"
@@ -526,6 +572,12 @@ class Planisferio(Node):
             self.get_logger().error(response.message)
             return response
         response.success, response.message = True, f"Saved {pgm} and {yml}"
+        if self.save_session_with_map:
+            try:
+                npz = save_session(self.slam, os.path.join(self.save_dir, name + "_session.npz"))
+                response.message += f" and session {npz}"
+            except (OSError, ValueError) as exc:
+                response.message += f" (session not saved: {exc})"
         self.last_save = os.path.join(self.save_dir, name)
         self.get_logger().info(response.message)
         return response
@@ -549,6 +601,8 @@ class Planisferio(Node):
             return "WAITING_FOR_SCANS"
         if not self.laser_ready:
             return "WAITING_FOR_LASER_TF"
+        if self.slam.awaiting_pose:
+            return "WAITING_FOR_POSE"
         if not self.used_wall:
             return "WAITING_FOR_ODOM" if self.stats["skipped_odom"] else "STARTING"
         if now - self.used_wall[-1] > 2.0:
@@ -570,7 +624,9 @@ class Planisferio(Node):
               ("keyframes", len(self.slam.keyframes) if self.slam.initialized else 0),
               ("loops", self.loop_count),
               ("corrections", self.slam.corrections),
-              ("backend_busy", int(bool(getattr(self.slam.backend, "busy", False))))]
+              ("backend_busy", int(bool(getattr(self.slam.backend, "busy", False)))),
+              ("localized", int(bool(self.slam.localized))),
+              ("localization_only", int(bool(self.slam.cfg.localization_only)))]
         ms = self.stats["proc_ms"][-50:]
         if ms:
             kv.append(("proc_ms", f"{np.mean(ms):.1f}"))

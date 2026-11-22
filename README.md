@@ -55,8 +55,9 @@ exploration.
 | out | `<ns>/scan` | `sensor_msgs/LaserScan` | The scan as used, debug |
 | out | `<ns>/status` | `std_msgs/String` | One line of `key=value` pairs at 1 Hz (state, scan rate, keyframes, loops, map size, pose), for supervisors and dashboards |
 | service | `<ns>/reset` | `std_srvs/Trigger` | Start a new map |
-| service | `<ns>/save_map` | `std_srvs/Trigger` | Save `<save_dir>/<prefix>_<date>_<time>.pgm/.yaml` |
+| service | `<ns>/save_map` | `std_srvs/Trigger` | Save `<save_dir>/<prefix>_<date>_<time>.pgm/.yaml`, and the session `…_session.npz` for map reuse |
 | service | `<ns>/optimize` | `std_srvs/Trigger` | Force an optimization and map rebuild |
+| in | `<ns>/set_pose`, `/initialpose` | `geometry_msgs/PoseWithCovarianceStamped` | Place the robot on a loaded map, or re-place it during a run (RViz "2D Pose Estimate") |
 
 ## Install
 
@@ -89,6 +90,28 @@ ros2 service call /slam/save_map std_srvs/srv/Trigger
 Drive the robot around. The log reports every loop closure and every correction
 applied. In RViz, pink lines appear between the old and the new pass, and
 doubled walls merge into one.
+
+## Map reuse
+
+A map can be saved and reused later, to localize on it or to extend it. Every
+`<ns>/save_map` also writes a **session file** (`<name>_session.npz`): the
+keyframes, their scans and the pose graph, from which the map is rebuilt exactly.
+
+```bash
+# localize on a saved map without changing it
+ros2 launch planisferio planisferio.launch.py params_file:=my_robot.yaml \
+    --ros-args -p load_session:=$HOME/maps/map_20261121_101500_session.npz -p localization_only:=true
+```
+
+After loading, the map is published at once, but Planisferio does not know where the
+robot is: it waits for a pose on `<ns>/set_pose` or `/initialpose` (RViz "2D Pose
+Estimate"), for example from a marker-based localizer or a known start spot. The pose
+may be off by several centimeters: the particle filter, seeded with the spread given in
+the message's covariance, converges onto the map within a few scans.
+
+With `localization_only: false` the loaded map is extended: the first new keyframe is
+joined to the nearest old one with a robust edge (it can be rejected if the given pose
+was wrong), and loop closure works across old and new keyframes.
 
 ## Configuration
 
@@ -227,7 +250,9 @@ colcon test --packages-select planisferio && colcon test-result --verbose
 They cover the SE(2) algebra, the pose-graph Jacobians against numerical
 derivatives, closing a drifting loop, rejecting a false loop closure, the scan
 matcher on a known offset, the occupancy grid and its growth, saving a map,
-that the parameter file and the node declare exactly the same parameters, and
+that the parameter file and the node declare exactly the same parameters, saving and
+reloading a session, localizing on a reloaded map from a pose that is several
+centimeters off, extending a reloaded map, and
 an end-to-end run on simulated data with ground truth (synchronous and
 threaded back-end).
 

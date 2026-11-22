@@ -100,6 +100,13 @@ class SlamConfig:
     seq_sigma_theta_per_rad: float = 0.005  # rad per rad turned
     seq_sigma_theta_per_m: float = 0.001    # rad per m travelled
     seq_use_particle_cov: bool = False      # add the particle-cloud covariance
+    # Map reuse: keep localizing on the map without adding keyframes (the map
+    # stays exactly as loaded or built so far).
+    localization_only: bool = False
+    # Uncertainty of the edge that joins the first keyframe after set_pose to the
+    # nearest existing keyframe (the robot was placed, not driven there).
+    reseed_sigma_xy: float = 0.10           # m
+    reseed_sigma_theta: float = 0.10        # rad
     # Loop closure / back-end
     loop: LoopClosureConfig = field(default_factory=LoopClosureConfig)
 
@@ -153,6 +160,12 @@ class SlamSystem:
         self._field = None
         self._field_version = -1
         self._field_occupied = 0
+        # Map reuse (session.load_session / set_pose)
+        self.loaded = False                     # the map came from a session file
+        self.awaiting_pose = False              # map known, robot position not yet
+        self.frontend_global = False            # match against the whole map
+        self._pending_seed = None               # (pose, std) applied at the next scan
+        self._link_next_keyframe = False        # join the next keyframe to the old graph
 
     def _new_local_map(self):
         c = self.cfg
@@ -186,7 +199,49 @@ class SlamSystem:
 
     # ------------------------------------------------------------------
     def _frontend_grid(self):
-        return self.local_map.grid if self.cfg.frontend_local_map else self.grid
+        if self.frontend_global or not self.cfg.frontend_local_map:
+            return self.grid
+        return self.local_map.grid
+
+    # ------------------------------------------------------------------
+    # Map reuse
+    # ------------------------------------------------------------------
+    def mark_loaded(self):
+        """Called by session.load_session after the keyframes are back in place."""
+        self.loaded = True
+        self.initialized = True                 # the map exists (published, saved)
+        self.awaiting_pose = True               # but the robot is not placed on it yet
+        self.frontend_global = True             # recent keyframes are not near the robot
+        self._field = None
+
+    def set_pose(self, pose, std=(0.05, 0.05, 0.05)):
+        """Place the robot on the map at `pose` (x, y, theta) with spread `std`.
+
+        Applied at the next processed scan (it needs the odometry at that time).
+        Works after load_session (first placement) and during a run (re-localization).
+        """
+        self._pending_seed = (np.asarray(pose, dtype=np.float64).copy(),
+                              tuple(float(s) for s in std))
+
+    @property
+    def localized(self):
+        """True once the robot has a pose on the map (not waiting for set_pose)."""
+        return self.initialized and not self.awaiting_pose
+
+    def _apply_seed(self, odom_pose):
+        pose, std = self._pending_seed
+        self._pending_seed = None
+        self.pf.initialize(pose, std)
+        self.pose = pose.copy()
+        self.cov = np.diag(np.square(std))
+        self.odom_at_update = odom_pose.copy()
+        self.last_keyframe_pose = pose.copy()
+        self._field = None
+        self.awaiting_pose = False
+        with self.lock:
+            has_graph = self.graph.n > 0
+        self._link_next_keyframe = has_graph
+        return SlamResult(self.pose.copy(), self.cov.copy())
 
     def _get_field(self, pose):
         c = self.cfg
@@ -219,6 +274,9 @@ class SlamSystem:
         return information_from_covariance(cov, (s_along, s_cross, s_th))
 
     def _add_keyframe(self, stamp, scan):
+        if self._link_next_keyframe:
+            self._add_reseeded_keyframe(stamp, scan)
+            return
         with self.lock:
             kid = len(self.keyframes)
             if kid == 0:
@@ -235,6 +293,33 @@ class SlamSystem:
                                               self._seq_information(prev_pose, z), "seq"))
         insert_keyframe(self.grid, kf, self.pose)
         if self.cfg.frontend_local_map:
+            self.local_map.add(kf, self.pose)
+        self.last_keyframe_pose = self.pose.copy()
+        self.backend.notify_keyframe(kid)
+
+    def _add_reseeded_keyframe(self, stamp, scan):
+        """First keyframe after set_pose: joined to the nearest old keyframe.
+
+        The robot was placed, not driven, so there is no odometry edge to the last
+        keyframe; instead a loop-type edge (robust kernel, may be rejected as an
+        outlier) links it to the closest keyframe with the uncertainty of the seed.
+        """
+        c = self.cfg
+        self._link_next_keyframe = False
+        with self.lock:
+            kid = len(self.keyframes)
+            poses = self.graph.poses[:kid]
+            j = int(np.argmin(np.hypot(poses[:, 0] - self.pose[0], poses[:, 1] - self.pose[1])))
+            path = self.keyframes[-1].path_dist
+            kf = keyframe_from_scan(kid, stamp, scan, path)
+            self.keyframes.append(kf)
+            self.graph.add_node(self.pose)
+            z = relative(poses[j], self.pose)
+            info = information_from_covariance(
+                np.zeros((3, 3)), (c.reseed_sigma_xy, c.reseed_sigma_xy, c.reseed_sigma_theta))
+            self.graph.add_edge(make_edge(j, kid, z, info, "loop"))
+        insert_keyframe(self.grid, kf, self.pose)
+        if c.frontend_local_map:
             self.local_map.add(kf, self.pose)
         self.last_keyframe_pose = self.pose.copy()
         self.backend.notify_keyframe(kid)
@@ -281,6 +366,11 @@ class SlamSystem:
         T, backend_res = self._apply_backend_result()
         corrected = T is not None
 
+        if self._pending_seed is not None:
+            return self._apply_seed(odom_pose)
+        if self.awaiting_pose:
+            return SlamResult(self.pose.copy(), self.cov.copy())
+
         if not self.initialized:
             self.pose = np.zeros(3)
             self.pf.initialize(self.pose)
@@ -318,8 +408,9 @@ class SlamSystem:
 
         # ---- KEYFRAME ----
         kf_delta = relative(self.last_keyframe_pose, self.pose)
-        keyframe = (math.hypot(kf_delta[0], kf_delta[1]) >= c.keyframe_d
-                    or abs(kf_delta[2]) >= c.keyframe_a)
+        keyframe = (not c.localization_only
+                    and (math.hypot(kf_delta[0], kf_delta[1]) >= c.keyframe_d
+                         or abs(kf_delta[2]) >= c.keyframe_a))
         if keyframe:
             self._add_keyframe(stamp, scan)
 

@@ -72,6 +72,7 @@
     map_name_prefix: map           # files are <prefix>_<date>_<time>.pgm / .yaml
     save_free_max: 50              # occupancy <= this is free (white)
     save_occupied_min: 65          # occupancy >= this is occupied (black)
+    save_session: true             # also save the session (<name>_session.npz) for map reuse
 
     status_period: 1.0             # [s] <namespace>/status (0 = off)
 
@@ -153,3 +154,12 @@
     loop_trigger_theta: 0.0175     # [rad] ...or by more than 1 deg
     loop_max_pending: 10           # ...or after this many small closures
     loop_rebuild_min_correction: 0.02  # [m] skip the map rebuild below this
+
+    # =========================================================================
+    # 6. MAP REUSE: start from a saved session instead of an empty map
+    # =========================================================================
+    load_session: ""               # path to a <name>_session.npz ("" = new map)
+    localization_only: false       # true = keep localizing, never change the map
+    # After loading, Planisferio waits for the robot's pose on <namespace>/set_pose or on
+    # this topic (RViz "2D Pose Estimate"). Both also re-place the robot during a run.
+    initial_pose_topic: /initialpose
